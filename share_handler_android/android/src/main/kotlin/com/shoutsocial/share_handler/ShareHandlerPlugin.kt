@@ -125,6 +125,17 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
 
   override fun resetInitialSharedMedia() {
     initialMedia = null
+    binding?.activity?.let { activity ->
+      val intent = activity.intent
+      if (intent.action == Intent.ACTION_SEND || intent.action == Intent.ACTION_SEND_MULTIPLE) {
+        intent.action = Intent.ACTION_MAIN
+        intent.removeExtra(Intent.EXTRA_STREAM)
+        intent.removeExtra(Intent.EXTRA_TEXT)
+        intent.removeExtra("conversationIdentifier")
+        intent.type = null
+        activity.intent = intent
+      }
+    }
   }
 
   override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
