@@ -129,7 +129,6 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
       .putString(KEY_HANDLED_INTENT_ID, intentId)
       .putLong(KEY_HANDLED_INTENT_TIME, System.currentTimeMillis())
       .apply()
-    Log.d("ShareHandlerPlugin", "Marked intent as handled: $intentId")
   }
 
   /**
@@ -145,6 +144,9 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
 
   override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
     applicationContext = flutterPluginBinding.applicationContext
+
+    // Clean up old cached files on plugin initialization
+    cleanupOldCachedFiles()
 
     val messenger = flutterPluginBinding.binaryMessenger
     Messages.ShareHandlerApi.setup(messenger, this)
@@ -332,22 +334,53 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
 
   private fun attachmentsFromIntent(intent: Intent?): List<Messages.SharedAttachment>? {
     if (intent == null) return null
-    return when (intent.action) {
+
+    // First, try to parse based on the specific intent action.
+    when (intent.action) {
       Intent.ACTION_SEND -> {
-        val uri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: return null
-        return listOf(attachmentForUri(uri)).mapNotNull { it }
+        intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let { uri ->
+          // Only return if attachment was successfully extracted; otherwise fall through to fallback
+          attachmentForUri(uri)?.let { return listOf(it) }
+        }
       }
 
       Intent.ACTION_SEND_MULTIPLE -> {
         val uris = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
-        val value = uris?.mapNotNull { uri ->
-          attachmentForUri(uri)
-        }?.toList()
-        return value
+        val value = uris?.mapNotNull { uri -> attachmentForUri(uri) }
+        if (!value.isNullOrEmpty()) return value
       }
 
-      else -> null
+      Intent.ACTION_VIEW -> {
+        // ACTION_VIEW is used when opening a file with "Open with" from other apps.
+        attachmentsFromClipDataOrData(intent)?.let { return it }
+      }
     }
+
+    // Fallback: if no attachments were extracted yet, try clipData/data regardless of action.
+    return attachmentsFromClipDataOrData(intent)
+  }
+
+  private fun attachmentsFromClipDataOrData(intent: Intent): List<Messages.SharedAttachment>? {
+    val attachments = mutableListOf<Messages.SharedAttachment>()
+    val processedUris = mutableSetOf<Uri>()
+
+    val clipData = intent.clipData
+    if (clipData != null && clipData.itemCount > 0) {
+      for (index in 0 until clipData.itemCount) {
+        val uri = clipData.getItemAt(index).uri ?: continue
+        processedUris.add(uri)
+        attachmentForUri(uri)?.let { attachments.add(it) }
+      }
+    }
+
+    // Only process intent.data if it wasn't already in clipData
+    intent.data?.let { dataUri ->
+      if (dataUri !in processedUris) {
+        attachmentForUri(dataUri)?.let { attachments.add(it) }
+      }
+    }
+
+    return attachments.takeIf { it.isNotEmpty() }
   }
 
   private fun attachmentForUri(uri: Uri): Messages.SharedAttachment? {
@@ -356,14 +389,16 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
     // Obtain the MIME type of the URI
     val mimeType = contentResolver.getType(uri)
 
-    // Get the absolute path from the URI
-    val path = FileDirectory.getAbsolutePath(applicationContext, uri) ?: return null
+    // Get the absolute path from the URI, falling back to copying into cache when needed.
+    val absolutePath = FileDirectory.getAbsolutePath(applicationContext, uri)
+    val cachedFile = if (absolutePath == null) cacheUriToFile(contentResolver, uri, mimeType) else null
+    val path = absolutePath ?: cachedFile?.absolutePath ?: return null
 
     val file = File(path)
 
-    // Check if the file name has an extension
-    if (file.extension.isNotEmpty()) {
-      // File has an extension; use it directly
+    // Check if the file name has an extension, or if it was already cached (which means it already has the correct name)
+    if (file.extension.isNotEmpty() || cachedFile != null) {
+      // File has an extension or was already cached; use it directly
       val type = getAttachmentType(mimeType)
       return Messages.SharedAttachment.Builder()
         .setPath(file.absolutePath)
@@ -375,8 +410,8 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
       // Obtain the file name from the URI, including extension
       val fileName = getFileNameFromUri(contentResolver, uri, mimeType) ?: return null
 
-      // Create a new file in the cache directory with the correct file name
-      val newFile = File(applicationContext.cacheDir, fileName)
+      // Create a new file in the cache directory with unique timestamp prefix to prevent collisions
+      val newFile = File(applicationContext.cacheDir, uniqueFileName(fileName))
 
       // Copy the contents from the URI to the new file
       val success = copyFile(contentResolver, uri, newFile)
@@ -393,6 +428,14 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
         .setType(type)
         .build()
     }
+  }
+
+  private fun cacheUriToFile(contentResolver: ContentResolver, uri: Uri, mimeType: String?): File? {
+    val fileName = getFileNameFromUri(contentResolver, uri, mimeType) ?: return null
+    // Add unique timestamp prefix to prevent file name collisions from different sources
+    val target = File(applicationContext.cacheDir, uniqueFileName(fileName))
+    val copied = copyFile(contentResolver, uri, target)
+    return if (copied) target else null
   }
 
   // Function to get the file name from the URI
@@ -449,6 +492,28 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
       mimeType?.startsWith("video") == true -> Messages.SharedAttachmentType.video
       mimeType?.startsWith("audio") == true -> Messages.SharedAttachmentType.audio
       else -> Messages.SharedAttachmentType.file
+    }
+  }
+
+  // Helper to generate unique file names with timestamp prefix to prevent collisions
+  private fun uniqueFileName(baseName: String): String = 
+    "${System.currentTimeMillis()}_$baseName"
+
+  /**
+   * Cleans up old cached files to prevent cache directory from growing indefinitely.
+   * Deletes files older than the specified max age (default: 1 hour).
+   */
+  private fun cleanupOldCachedFiles(maxAgeMs: Long = 60 * 60 * 1000L) {
+    try {
+      val cacheDir = applicationContext.cacheDir
+      val now = System.currentTimeMillis()
+      cacheDir.listFiles()?.forEach { file ->
+        if (file.isFile && (now - file.lastModified()) > maxAgeMs) {
+          file.delete()
+        }
+      }
+    } catch (e: Exception) {
+      // Silently ignore cleanup failures
     }
   }
 }
