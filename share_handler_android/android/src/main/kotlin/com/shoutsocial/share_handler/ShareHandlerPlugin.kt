@@ -27,6 +27,12 @@ import java.io.FileOutputStream
 import java.net.URLConnection
 
 private const val kEventsChannel = "com.shoutsocial.share_handler/sharedMediaStream"
+private const val PREFS_NAME = "share_handler_prefs"
+private const val KEY_HANDLED_INTENT_ID = "handled_intent_id"
+private const val KEY_HANDLED_INTENT_TIME = "handled_intent_time"
+// Expiry time of 60 seconds: long enough to cover process restart, 
+// but short enough to allow users to quickly re-share the same content
+private const val INTENT_EXPIRY_MS = 60 * 1000L
 
 /** ShareHandlerPlugin */
 class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel.StreamHandler, ActivityAware,
@@ -37,6 +43,105 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
 
   private var binding: ActivityPluginBinding? = null
   private lateinit var applicationContext: Context
+
+  /**
+   * Generates a unique identifier for a share Intent based on its content.
+   * Returns null if the Intent doesn't contain share-related data.
+   */
+  private fun getIntentId(intent: Intent): String? {
+    if (intent.action != Intent.ACTION_SEND && intent.action != Intent.ACTION_SEND_MULTIPLE) {
+      return null
+    }
+
+    val parts = mutableListOf<String>()
+
+    // Add action
+    parts.add(intent.action ?: "")
+
+    // Add URIs from EXTRA_STREAM
+    when (intent.action) {
+      Intent.ACTION_SEND -> {
+        intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)?.let {
+          parts.add(it.toString())
+        }
+      }
+      Intent.ACTION_SEND_MULTIPLE -> {
+        intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.forEach {
+          parts.add(it.toString())
+        }
+      }
+    }
+
+    // Add text content
+    intent.getStringExtra(Intent.EXTRA_TEXT)?.let {
+      parts.add(it)
+    }
+
+    // Add conversation identifier
+    (intent.getStringExtra("android.intent.extra.shortcut.ID")
+      ?: intent.getStringExtra("conversationIdentifier"))?.let {
+      parts.add(it)
+    }
+
+    // Add MIME type
+    intent.type?.let {
+      parts.add(it)
+    }
+
+    // If no meaningful content, return null
+    if (parts.size <= 1) {
+      return null
+    }
+
+    // Generate a hash of the content
+    return parts.joinToString("|").hashCode().toString()
+  }
+
+  /**
+   * Checks if the given Intent has already been handled (persisted across process death).
+   * Uses a time-based expiration to allow re-sharing the same content after a short period.
+   */
+  private fun isIntentAlreadyHandled(intent: Intent): Boolean {
+    val intentId = getIntentId(intent) ?: return false
+    val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val handledIntentId = prefs.getString(KEY_HANDLED_INTENT_ID, null)
+    val handledTime = prefs.getLong(KEY_HANDLED_INTENT_TIME, 0L)
+    
+    // Only consider as duplicate if ID matches AND within expiry window
+    if (intentId == handledIntentId) {
+      val elapsed = System.currentTimeMillis() - handledTime
+      if (elapsed < INTENT_EXPIRY_MS) {
+        return true
+      }
+      // Expired, clear the old record
+      clearHandledIntent()
+    }
+    return false
+  }
+
+  /**
+   * Marks the given Intent as handled in persistent storage with timestamp.
+   */
+  private fun markIntentAsHandled(intent: Intent) {
+    val intentId = getIntentId(intent) ?: return
+    val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit()
+      .putString(KEY_HANDLED_INTENT_ID, intentId)
+      .putLong(KEY_HANDLED_INTENT_TIME, System.currentTimeMillis())
+      .apply()
+    Log.d("ShareHandlerPlugin", "Marked intent as handled: $intentId")
+  }
+
+  /**
+   * Clears the handled Intent record from persistent storage.
+   */
+  private fun clearHandledIntent() {
+    val prefs = applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    prefs.edit()
+      .remove(KEY_HANDLED_INTENT_ID)
+      .remove(KEY_HANDLED_INTENT_TIME)
+      .apply()
+  }
 
   override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
     applicationContext = flutterPluginBinding.applicationContext
@@ -128,6 +233,9 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
     binding?.activity?.let { activity ->
       val intent = activity.intent
       if (intent.action == Intent.ACTION_SEND || intent.action == Intent.ACTION_SEND_MULTIPLE) {
+        // Mark this intent as handled in persistent storage before modifying it
+        markIntentAsHandled(intent)
+        
         intent.action = Intent.ACTION_MAIN
         intent.removeExtra(Intent.EXTRA_STREAM)
         intent.removeExtra(Intent.EXTRA_TEXT)
@@ -149,12 +257,17 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
   override fun onAttachedToActivity(binding: ActivityPluginBinding) {
     this.binding = binding
     binding.addOnNewIntentListener(this)
-    val flags: Int = binding.activity.intent.flags
+    val intent = binding.activity.intent
+    val flags: Int = intent.flags
     if ((flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) {
       // The activity was launched from history
-      Log.w("TAG", "Handle skip: The activity was launched from history")
+      Log.w("ShareHandlerPlugin", "Handle skip: The activity was launched from history")
+    } else if (isIntentAlreadyHandled(intent)) {
+      // The intent was already handled before process death
+      Log.w("ShareHandlerPlugin", "Handle skip: Intent already handled before process death")
     } else {
-      handleIntent(binding.activity.intent, true)
+      handleIntent(intent, true)
+      markIntentAsHandled(intent)
     }
   }
 
@@ -172,7 +285,11 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
   }
 
   override fun onNewIntent(intent: Intent): Boolean {
+    // Clear any previous handled intent marker for hot-start shares
+    // This ensures new shares are always processed even if content is identical
+    clearHandledIntent()
     handleIntent(intent, false)
+    markIntentAsHandled(intent)
     return false
   }
 
@@ -180,7 +297,7 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
     val attachments: List<Messages.SharedAttachment>? = try {
       attachmentsFromIntent(intent)
     } catch (e: Exception) {
-      Log.e("TAG", "Error parsing attachments", e)
+      Log.e("ShareHandlerPlugin", "Error parsing attachments", e)
       null
     }
 
@@ -208,7 +325,7 @@ class ShareHandlerPlugin : FlutterPlugin, Messages.ShareHandlerApi, EventChannel
       if (eventSink != null) {
         eventSink?.success(media.toMap())
       } else {
-        Log.w("TAG", "EventSink is not available")
+        Log.w("ShareHandlerPlugin", "EventSink is not available")
       }
     }
   }
